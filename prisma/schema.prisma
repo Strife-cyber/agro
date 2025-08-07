@@ -6,30 +6,49 @@ generator client {
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
+  schemas  = ["neon_auth", "public"]
+}
+
+model users_sync {
+  raw_json   Json
+  id         String    @id @default(dbgenerated("(raw_json ->> 'id'::text)"))
+  name       String?   @default(dbgenerated("(raw_json ->> 'display_name'::text)"))
+  email      String?   @default(dbgenerated("(raw_json ->> 'primary_email'::text)"))
+  created_at DateTime? @default(dbgenerated("to_timestamp((trunc((((raw_json ->> 'signed_up_at_millis'::text))::bigint)::double precision) / (1000)::double precision))")) @db.Timestamptz(6)
+  updated_at DateTime? @db.Timestamptz(6)
+  deleted_at DateTime? @db.Timestamptz(6)
+  users      users?
+
+  @@index([deleted_at])
+  @@schema("neon_auth")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
-/// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
 model approvisionnements {
   approvisionnement_id                                  String                    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  supplier_id                                           String                    @db.Uuid
+  supplier_id                                           String
   product_id                                            String                    @db.Uuid
   warehouse_id                                          String                    @db.Uuid
   quantity                                              Decimal                   @db.Decimal(10, 2)
   proposed_price                                        Decimal                   @db.Decimal(10, 2)
   delivery_date                                         DateTime                  @db.Date
   status                                                approvisionnement_status? @default(pending)
-  business_developer_id                                 String?                   @db.Uuid
-  stock_manager_id                                      String?                   @db.Uuid
+  business_developer_id                                 String?
+  stock_manager_id                                      String?
   created_at                                            DateTime?                 @default(now()) @db.Timestamp(6)
   updated_at                                            DateTime?                 @db.Timestamp(6)
-  users_approvisionnements_business_developer_idTousers users?                    @relation("approvisionnements_business_developer_idTousers", fields: [business_developer_id], references: [user_id], onUpdate: NoAction)
+  users_approvisionnements_business_developer_idTousers users?                    @relation("approvisionnements_business_developer_idTousers", fields: [business_developer_id], references: [id], onUpdate: NoAction)
   products                                              products                  @relation(fields: [product_id], references: [product_id], onUpdate: NoAction)
-  users_approvisionnements_stock_manager_idTousers      users?                    @relation("approvisionnements_stock_manager_idTousers", fields: [stock_manager_id], references: [user_id], onUpdate: NoAction)
-  users_approvisionnements_supplier_idTousers           users                     @relation("approvisionnements_supplier_idTousers", fields: [supplier_id], references: [user_id], onUpdate: NoAction)
+  users_approvisionnements_stock_manager_idTousers      users?                    @relation("approvisionnements_stock_manager_idTousers", fields: [stock_manager_id], references: [id], onUpdate: NoAction)
+  users_approvisionnements_supplier_idTousers           users                     @relation("approvisionnements_supplier_idTousers", fields: [supplier_id], references: [id], onUpdate: NoAction)
   warehouses                                            warehouses                @relation(fields: [warehouse_id], references: [warehouse_id], onUpdate: NoAction)
   payments                                              payments[]
   stocks                                                stocks[]
+
+  @@index([product_id], map: "idx_approvisionnement_product")
+  @@index([status], map: "idx_approvisionnement_status")
+  @@index([supplier_id], map: "idx_approvisionnement_supplier")
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
@@ -38,28 +57,35 @@ model categories {
   name        String     @unique @db.VarChar(50)
   description String?
   products    products[]
+
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
 model deliveries {
   delivery_id     String                @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
   order_id        String                @db.Uuid
-  driver_id       String?               @db.Uuid
+  driver_id       String?
   status          delivery_status?      @default(assigned)
   gps_coordinates Unsupported("point")?
   eta             DateTime?             @db.Timestamp(6)
   delivery_date   DateTime?             @db.Timestamp(6)
   created_at      DateTime?             @default(now()) @db.Timestamp(6)
   updated_at      DateTime?             @db.Timestamp(6)
-  users           users?                @relation(fields: [driver_id], references: [user_id], onUpdate: NoAction)
+  users           users?                @relation(fields: [driver_id], references: [id], onUpdate: NoAction)
   orders          orders                @relation(fields: [order_id], references: [order_id], onDelete: Cascade, onUpdate: NoAction)
   notifications   notifications[]
+
+  @@index([driver_id], map: "idx_delivery_driver")
+  @@index([order_id], map: "idx_delivery_order")
+  @@index([status], map: "idx_delivery_status")
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
 model notifications {
   notification_id String               @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  user_id         String               @db.Uuid
+  user_id         String
   order_id        String?              @db.Uuid
   delivery_id     String?              @db.Uuid
   type            notification_type
@@ -68,7 +94,12 @@ model notifications {
   sent_at         DateTime?            @default(now()) @db.Timestamp(6)
   deliveries      deliveries?          @relation(fields: [delivery_id], references: [delivery_id], onUpdate: NoAction)
   orders          orders?              @relation(fields: [order_id], references: [order_id], onUpdate: NoAction)
-  users           users                @relation(fields: [user_id], references: [user_id], onDelete: Cascade, onUpdate: NoAction)
+  users           users                @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@index([delivery_id], map: "idx_notification_delivery")
+  @@index([order_id], map: "idx_notification_order")
+  @@index([user_id], map: "idx_notification_user")
+  @@schema("public")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
@@ -81,13 +112,17 @@ model order_items {
   unit_price    Decimal  @db.Decimal(10, 2)
   orders        orders   @relation(fields: [order_id], references: [order_id], onDelete: Cascade, onUpdate: NoAction)
   products      products @relation(fields: [product_id], references: [product_id], onUpdate: NoAction)
+
+  @@index([order_id], map: "idx_orderitem_order")
+  @@index([product_id], map: "idx_orderitem_product")
+  @@schema("public")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
 model orders {
   order_id         String          @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  client_id        String          @db.Uuid
+  client_id        String
   warehouse_id     String          @db.Uuid
   order_date       DateTime?       @default(now()) @db.Timestamp(6)
   total_amount     Decimal         @db.Decimal(10, 2)
@@ -100,9 +135,13 @@ model orders {
   deliveries       deliveries[]
   notifications    notifications[]
   order_items      order_items[]
-  users            users           @relation(fields: [client_id], references: [user_id], onUpdate: NoAction)
+  users            users           @relation(fields: [client_id], references: [id], onUpdate: NoAction)
   warehouses       warehouses      @relation(fields: [warehouse_id], references: [warehouse_id], onUpdate: NoAction)
   payments         payments[]
+
+  @@index([client_id], map: "idx_order_client")
+  @@index([status], map: "idx_order_status")
+  @@schema("public")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
@@ -118,6 +157,10 @@ model payments {
   created_at           DateTime?           @default(now()) @db.Timestamp(6)
   approvisionnements   approvisionnements? @relation(fields: [approvisionnement_id], references: [approvisionnement_id], onUpdate: NoAction)
   orders               orders?             @relation(fields: [order_id], references: [order_id], onUpdate: NoAction)
+
+  @@index([approvisionnement_id], map: "idx_payment_approvisionnement")
+  @@index([order_id], map: "idx_payment_order")
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
@@ -133,6 +176,8 @@ model products {
   order_items        order_items[]
   categories         categories?          @relation(fields: [category_id], references: [category_id], onUpdate: NoAction)
   stocks             stocks[]
+
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
@@ -142,6 +187,8 @@ model roles {
   description String?
   created_at  DateTime?    @default(now()) @db.Timestamp(6)
   user_roles  user_roles[]
+
+  @@schema("public")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
@@ -157,6 +204,10 @@ model stocks {
   approvisionnements   approvisionnements? @relation(fields: [approvisionnement_id], references: [approvisionnement_id], onUpdate: NoAction)
   products             products            @relation(fields: [product_id], references: [product_id], onUpdate: NoAction)
   warehouses           warehouses          @relation(fields: [warehouse_id], references: [warehouse_id], onUpdate: NoAction)
+
+  @@index([product_id], map: "idx_stock_product")
+  @@index([warehouse_id], map: "idx_stock_warehouse")
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
@@ -166,36 +217,41 @@ model transaction_logs {
   entity_id   String             @db.Uuid
   action      transaction_action
   details     Json?
-  user_id     String?            @db.Uuid
+  user_id     String?
   created_at  DateTime?          @default(now()) @db.Timestamp(6)
-  users       users?             @relation(fields: [user_id], references: [user_id], onUpdate: NoAction)
+  users       users?             @relation(fields: [user_id], references: [id], onUpdate: NoAction)
+
+  @@index([entity_id], map: "idx_transactionlog_entity_id")
+  @@index([entity_type], map: "idx_transactionlog_entity_type")
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
 model user_roles {
   user_role_id String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
-  user_id      String    @db.Uuid
+  user_id      String
   role_id      String    @db.Uuid
   assigned_at  DateTime? @default(now()) @db.Timestamp(6)
   revoked_at   DateTime? @db.Timestamp(6)
   roles        roles     @relation(fields: [role_id], references: [role_id], onUpdate: NoAction)
-  users        users     @relation(fields: [user_id], references: [user_id], onDelete: Cascade, onUpdate: NoAction)
+  users        users     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([user_id, role_id], map: "unique_user_role")
+  @@index([role_id], map: "idx_userrole_role")
+  @@index([user_id], map: "idx_userrole_user")
+  @@schema("public")
 }
 
 /// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
 model users {
-  user_id                                                            String               @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  id                                                                 String               @id
   email                                                              String               @unique @db.VarChar(255)
   name                                                               String               @db.VarChar(100)
   phone                                                              String?              @db.VarChar(20)
   address                                                            String?
-  status                                                             user_status?         @default(active)
   created_at                                                         DateTime?            @default(now()) @db.Timestamp(6)
   updated_at                                                         DateTime?            @db.Timestamp(6)
-  password                                                           String?
   approvisionnements_approvisionnements_business_developer_idTousers approvisionnements[] @relation("approvisionnements_business_developer_idTousers")
   approvisionnements_approvisionnements_stock_manager_idTousers      approvisionnements[] @relation("approvisionnements_stock_manager_idTousers")
   approvisionnements_approvisionnements_supplier_idTousers           approvisionnements[] @relation("approvisionnements_supplier_idTousers")
@@ -204,6 +260,9 @@ model users {
   orders                                                             orders[]
   transaction_logs                                                   transaction_logs[]
   user_roles                                                         user_roles[]
+  users_sync                                                         users_sync           @relation(fields: [id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_usersync")
+
+  @@schema("public")
 }
 
 /// This model or at least one of its fields has comments in the database, and requires an additional setup for migrations: Read more: https://pris.ly/d/database-comments
@@ -215,6 +274,8 @@ model warehouses {
   approvisionnements approvisionnements[]
   orders             orders[]
   stocks             stocks[]
+
+  @@schema("public")
 }
 
 enum approvisionnement_status {
@@ -222,6 +283,8 @@ enum approvisionnement_status {
   validated_bd
   received
   rejected
+
+  @@schema("public")
 }
 
 enum delivery_status {
@@ -229,6 +292,8 @@ enum delivery_status {
   in_transit
   delivered
   failed
+
+  @@schema("public")
 }
 
 enum entity_type {
@@ -238,16 +303,22 @@ enum entity_type {
   deliveries
   payments
   user_roles
+
+  @@schema("public")
 }
 
 enum notification_status {
   sent
   failed
+
+  @@schema("public")
 }
 
 enum notification_type {
   email
   sms
+
+  @@schema("public")
 }
 
 enum order_status {
@@ -256,17 +327,23 @@ enum order_status {
   shipped
   delivered
   cancelled
+
+  @@schema("public")
 }
 
 enum payment_method {
   direct
   credit
+
+  @@schema("public")
 }
 
 enum payment_status {
   pending
   completed
   failed
+
+  @@schema("public")
 }
 
 enum transaction_action {
@@ -278,9 +355,13 @@ enum transaction_action {
   INSERT
   UPDATE
   DELETE
+
+  @@schema("public")
 }
 
 enum user_status {
   active
   inactive
+
+  @@schema("public")
 }
