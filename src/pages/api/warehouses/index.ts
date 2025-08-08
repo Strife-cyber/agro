@@ -1,5 +1,13 @@
 import { prisma } from "@/lib/prisma";
 import { createCrudHandler } from "@/utils/crud-handler";
+import { warehouseSchema } from "@/utils/validation-schemas";
 
-// Create a CRUD handler for the 'users' model
-export default createCrudHandler('warehouses', prisma);
+export default createCrudHandler({
+  model: 'warehouses',
+  prisma,
+  validationSchema: warehouseSchema,
+  allowedRoles: ['admin', 'business_developer'],
+  enablePagination: true,
+  enableSoftDelete: true,
+  auditLog: true,
+});
