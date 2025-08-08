@@ -1,34 +1,29 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 // src/utils/crudHandler.ts
-import { z } from 'zod'
-import { prisma } from '@/lib/prisma'
-import { PrismaClient } from '@/generated/prisma'
 import { NextApiRequest, NextApiResponse } from 'next'
+import { PrismaClient } from '@prisma/client'
+import { z } from 'zod'
 
-// Get type-safe keys from PrismaClient that map to model delegates
+// Type definitions
 type ModelKeys = Extract<keyof PrismaClient, string>
 
-// Base validation schemas for common operations
-const baseValidationSchemas = {
-  id: z.string().uuid(),
-  pagination: z.object({
-    page: z.coerce.number().min(1).default(1),
-    limit: z.coerce.number().min(1).max(100).default(20),
-  }),
-  search: z.object({
-    query: z.string().min(1).optional(),
-    filters: z.record(z.any()).optional(),
-  }),
+interface User {
+  id: string
+  email: string
+  name: string
+  role: string | null
 }
 
-// Error response interface
+interface RecordWithId {
+  id?: string
+  [key: string]: unknown
+}
+
 interface ErrorResponse {
   error: string
   code: string
-  details?: any
+  details?: object
 }
 
-// Success response interface
 interface SuccessResponse<T> {
   data: T
   message: string
@@ -40,7 +35,6 @@ interface SuccessResponse<T> {
   }
 }
 
-// CRUD Handler configuration
 interface CrudHandlerConfig {
   model: ModelKeys
   prisma: PrismaClient
@@ -52,17 +46,39 @@ interface CrudHandlerConfig {
   auditLog?: boolean
 }
 
-// Rate limiting store (in production, use Redis)
-const rateLimitStore = new Map<string, { count: number; resetTime: number }>()
+// Helper function to get record ID safely
+function getRecordId(record: RecordWithId, modelName: string): string {
+  if (record.id) {
+    return record.id
+  }
+  
+  const idField = `${modelName.slice(0, -1)}_id`
+  const idValue = record[idField]
+  
+  if (typeof idValue === 'string') {
+    return idValue
+  }
+  
+  throw new Error(`Could not determine ID for record from model ${modelName}`)
+}
 
-// Rate limiting function
+// Validation schemas
+const baseValidationSchemas = {
+  pagination: z.object({
+    page: z.number().min(1).default(1),
+    limit: z.number().min(1).max(100).default(10),
+  }),
+}
+
+// Rate limiting
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>()
+
 function checkRateLimit(ip: string, limit: number = 100, windowMs: number = 15 * 60 * 1000): boolean {
   const now = Date.now()
-  const key = `rate_limit:${ip}`
-  const record = rateLimitStore.get(key)
+  const record = rateLimitMap.get(ip)
 
   if (!record || now > record.resetTime) {
-    rateLimitStore.set(key, { count: 1, resetTime: now + windowMs })
+    rateLimitMap.set(ip, { count: 1, resetTime: now + windowMs })
     return true
   }
 
@@ -75,17 +91,23 @@ function checkRateLimit(ip: string, limit: number = 100, windowMs: number = 15 *
 }
 
 // Input sanitization
-function sanitizeInput(input: any): any {
+function sanitizeInput(input: object | string): object | string {
   if (typeof input === 'string') {
     return input.trim().replace(/[<>]/g, '')
   }
+
   if (typeof input === 'object' && input !== null) {
-    const sanitized: any = {}
+    const sanitized: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(input)) {
-      sanitized[key] = sanitizeInput(value)
+      if (typeof value === 'string') {
+        sanitized[key] = value.trim().replace(/[<>]/g, '')
+      } else {
+        sanitized[key] = value
+      }
     }
     return sanitized
   }
+
   return input
 }
 
@@ -93,12 +115,20 @@ function sanitizeInput(input: any): any {
 async function checkAuthorization(
   req: NextApiRequest,
   allowedRoles?: string[]
-): Promise<{ authorized: boolean; user?: any; error?: string }> {
+): Promise<{ authorized: boolean; user?: User; error?: string }> {
   try {
     // Get user data from middleware headers
-    const userId = req.headers['x-user-id'] as string
+    const userId = req.headers['x-user-id'] as string // Assuming middleware sets this
 
-    const user = await prisma.users.findUnique({
+    if (!userId) {
+      return { authorized: false, error: 'Authentication required: User ID missing from headers' }
+    }
+
+    // Import prisma instance dynamically to avoid circular dependencies
+    const { prisma } = await import('@/lib/prisma')
+
+    // Fetch user data from database using user ID
+    const dbUser = await prisma.users.findUnique({
       where: { id: userId },
       select: {
         id: true,
@@ -108,21 +138,21 @@ async function checkAuthorization(
         created_at: true,
         updated_at: true,
       },
-    });
-    
-    if (!user) {
-      return { authorized: false, error: 'Authentication required' }
+    })
+
+    if (!dbUser) {
+      return { authorized: false, error: 'User not found in database' }
     }
 
     // Check role-based access control
     if (allowedRoles && allowedRoles.length > 0) {
-      const userRole = user.role || 'client'
+      const userRole = dbUser.role || 'client'
       if (!allowedRoles.includes(userRole)) {
         return { authorized: false, error: 'Insufficient permissions' }
       }
     }
 
-    return { authorized: true, user }
+    return { authorized: true, user: dbUser }
   } catch (error) {
     console.error('Authorization check failed:', error)
     return { authorized: false, error: 'Authorization check failed' }
@@ -136,14 +166,14 @@ async function logAuditAction(
   entityType: string,
   entityId: string,
   userId?: string,
-  details?: any
+  details?: object
 ) {
   try {
     await prisma.transaction_logs.create({
       data: {
-        entity_type: entityType as any,
+        entity_type: entityType as 'approvisionnements' | 'stocks' | 'orders' | 'deliveries' | 'payments' | 'user_roles',
         entity_id: entityId,
-        action: action as any,
+        action: action as 'create' | 'insert' | 'update' | 'delete' | 'CREATE' | 'INSERT' | 'UPDATE' | 'DELETE',
         details: details || {},
         user_id: userId,
       },
@@ -178,24 +208,23 @@ export const createCrudHandler = (config: CrudHandlerConfig) => {
       }
 
       // Sanitize input
-      const sanitizedBody = sanitizeInput(req.body)
-      const sanitizedQuery = sanitizeInput(req.query)
+      const sanitizedBody = sanitizeInput(req.body) as Record<string, unknown>
+      const sanitizedQuery = sanitizeInput(req.query) as Record<string, unknown>
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const delegate = config.prisma[config.model] as any
+      const delegate = config.prisma[config.model]
 
       switch (req.method) {
         case 'GET':
           return await handleGet(req, res, delegate, config, sanitizedQuery)
 
         case 'POST':
-          return await handlePost(req, res, delegate, config, sanitizedBody, authResult.user)
+          return await handlePost(req, res, delegate, config, sanitizedBody, authResult.user!)
 
         case 'PUT':
-          return await handlePut(req, res, delegate, config, sanitizedBody, authResult.user)
+          return await handlePut(req, res, delegate, config, sanitizedBody, authResult.user!)
 
         case 'DELETE':
-          return await handleDelete(req, res, delegate, config, sanitizedBody, authResult.user)
+          return await handleDelete(req, res, delegate, config, sanitizedBody, authResult.user!)
 
         default:
           return res.status(405).json({
@@ -226,9 +255,9 @@ export const createCrudHandler = (config: CrudHandlerConfig) => {
 async function handleGet(
   req: NextApiRequest,
   res: NextApiResponse,
-  delegate: any,
+  delegate: PrismaClient[ModelKeys],
   config: CrudHandlerConfig,
-  query: any
+  query: Record<string, unknown>
 ) {
   try {
     const { id } = query
@@ -236,7 +265,7 @@ async function handleGet(
     // Single record by ID
     if (id) {
       const record = await delegate.findUnique({
-        where: { id },
+        where: { id: id as string },
       })
 
       if (!record) {
@@ -249,7 +278,7 @@ async function handleGet(
       return res.status(200).json({
         data: record,
         message: 'Record retrieved successfully',
-      } as SuccessResponse<any>)
+      } as SuccessResponse<object>)
     }
 
     // Multiple records with pagination
@@ -275,7 +304,7 @@ async function handleGet(
           total,
           totalPages: Math.ceil(total / pagination.limit),
         },
-      } as SuccessResponse<any>)
+      } as SuccessResponse<object>)
     }
 
     // Simple findMany without pagination
@@ -286,7 +315,7 @@ async function handleGet(
     return res.status(200).json({
       data: records,
       message: 'Records retrieved successfully',
-    } as SuccessResponse<any>)
+    } as SuccessResponse<object>)
   } catch (error: unknown) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({
@@ -303,10 +332,10 @@ async function handleGet(
 async function handlePost(
   req: NextApiRequest,
   res: NextApiResponse,
-  delegate: any,
+  delegate: PrismaClient[ModelKeys],
   config: CrudHandlerConfig,
-  body: any,
-  user: any
+  body: Record<string, unknown>,
+  user: User
 ) {
   try {
     // Validate input if schema provided
@@ -322,7 +351,10 @@ async function handlePost(
       updated_at: new Date(),
     }
 
-    const created = await delegate.create({ data: dataWithAudit })
+    // Create record
+    const record = await delegate.create({
+      data: dataWithAudit,
+    })
 
     // Audit logging
     if (config.auditLog) {
@@ -330,16 +362,16 @@ async function handlePost(
         config.prisma,
         'CREATE',
         config.model,
-        created.id || created[`${config.model}_id`],
-        user?.id,
-        { data: validatedData }
+        getRecordId(record as RecordWithId, config.model),
+        user.id,
+        { action: 'create', data: validatedData }
       )
     }
 
     return res.status(201).json({
-      data: created,
+      data: record,
       message: 'Record created successfully',
-    } as SuccessResponse<any>)
+    } as SuccessResponse<object>)
   } catch (error: unknown) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({
@@ -356,10 +388,10 @@ async function handlePost(
 async function handlePut(
   req: NextApiRequest,
   res: NextApiResponse,
-  delegate: any,
+  delegate: PrismaClient[ModelKeys],
   config: CrudHandlerConfig,
-  body: any,
-  user: any
+  body: Record<string, unknown>,
+  user: User
 ) {
   try {
     const { id, ...updateData } = body
@@ -374,13 +406,7 @@ async function handlePut(
     // Validate input if schema provided
     let validatedData = updateData
     if (config.validationSchema) {
-      // Use .extend({}).partial() for partial validation on update (workaround for ZodType)
-      if (typeof (config.validationSchema as any).partial === 'function') {
-        validatedData = (config.validationSchema as any).partial().parse(updateData)
-      } else {
-        // fallback: skip partial validation if not supported
-        validatedData = config.validationSchema.parse(updateData)
-      }
+      validatedData = config.validationSchema.parse(updateData)
     }
 
     // Add audit fields
@@ -389,8 +415,9 @@ async function handlePut(
       updated_at: new Date(),
     }
 
-    const updated = await delegate.update({
-      where: { id },
+    // Update record
+    const record = await delegate.update({
+      where: { id: id as string },
       data: dataWithAudit,
     })
 
@@ -400,16 +427,16 @@ async function handlePut(
         config.prisma,
         'UPDATE',
         config.model,
-        id,
-        user?.id,
-        { data: validatedData }
+        getRecordId(record as RecordWithId, config.model),
+        user.id,
+        { action: 'update', data: validatedData }
       )
     }
 
     return res.status(200).json({
-      data: updated,
+      data: record,
       message: 'Record updated successfully',
-    } as SuccessResponse<any>)
+    } as SuccessResponse<object>)
   } catch (error: unknown) {
     if (error instanceof z.ZodError) {
       return res.status(400).json({
@@ -426,10 +453,10 @@ async function handlePut(
 async function handleDelete(
   req: NextApiRequest,
   res: NextApiResponse,
-  delegate: any,
+  delegate: PrismaClient[ModelKeys],
   config: CrudHandlerConfig,
-  body: any,
-  user: any
+  body: Record<string, unknown>,
+  user: User
 ) {
   try {
     const { id } = body
@@ -441,18 +468,21 @@ async function handleDelete(
       } as ErrorResponse)
     }
 
-    let deleted
+    let record: object
 
     if (config.enableSoftDelete) {
-      // Soft delete
-      deleted = await delegate.update({
-        where: { id },
-        data: { deleted_at: new Date() },
+      // Soft delete - update deleted_at field
+      record = await delegate.update({
+        where: { id: id as string },
+        data: {
+          deleted_at: new Date(),
+          updated_at: new Date(),
+        },
       })
     } else {
       // Hard delete
-      deleted = await delegate.delete({
-        where: { id },
+      record = await delegate.delete({
+        where: { id: id as string },
       })
     }
 
@@ -462,17 +492,24 @@ async function handleDelete(
         config.prisma,
         'DELETE',
         config.model,
-        id,
-        user?.id,
-        { softDelete: config.enableSoftDelete }
+        getRecordId(record as RecordWithId, config.model),
+        user.id,
+        { action: 'delete', soft_delete: config.enableSoftDelete }
       )
     }
 
     return res.status(200).json({
-      data: deleted,
-      message: 'Record deleted successfully',
-    } as SuccessResponse<any>)
-  } catch (error) {
+      data: record,
+      message: config.enableSoftDelete ? 'Record soft deleted successfully' : 'Record deleted successfully',
+    } as SuccessResponse<object>)
+  } catch (error: unknown) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        error: 'Invalid input data',
+        code: 'VALIDATION_ERROR',
+        details: error.errors,
+      } as ErrorResponse)
+    }
     throw error
   }
 }

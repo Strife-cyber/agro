@@ -1,18 +1,50 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import { NextApiRequest, NextApiResponse } from 'next'
-import { prisma } from '@/lib/prisma'
 import { z } from 'zod'
+import { Stock, Warehouse } from '@/types'
+import { prisma } from '@/lib/prisma'
+import { NextApiRequest, NextApiResponse } from 'next'
 
-// Validation schema for stock management actions
-const stockManagementSchema = z.object({
-  action: z.enum(['adjust', 'transfer', 'report', 'alert']),
-  product_id: z.string().uuid().optional(),
-  warehouse_id: z.string().uuid().optional(),
-  quantity: z.number().optional(),
-  from_warehouse_id: z.string().uuid().optional(),
-  to_warehouse_id: z.string().uuid().optional(),
+// Type definitions for stock management
+interface User {
+  id: string
+  email: string
+  name: string
+  role: string
+}
+
+interface StockData {
+  product_id: string
+  warehouse_id: string
+  quantity: number
+  unit_price?: number
+  reason?: string
+}
+
+interface StockAlertData {
+  product_id: string
+  threshold: number
+}
+
+// Validation schemas
+const stockAdjustmentSchema = z.object({
+  action: z.enum(['add', 'remove']),
+  product_id: z.string().uuid(),
+  warehouse_id: z.string().uuid(),
+  quantity: z.number().positive(),
+  unit_price: z.number().positive().optional(),
   reason: z.string().optional(),
-  threshold: z.number().positive().optional(), // For alerts
+})
+
+const stockTransferSchema = z.object({
+  product_id: z.string().uuid(),
+  from_warehouse_id: z.string().uuid(),
+  to_warehouse_id: z.string().uuid(),
+  quantity: z.number().positive(),
+  reason: z.string().optional(),
+})
+
+const stockAlertSchema = z.object({
+  product_id: z.string().uuid(),
+  threshold: z.number().positive(),
 })
 
 /**
@@ -20,40 +52,33 @@ const stockManagementSchema = z.object({
  * 
  * This endpoint handles comprehensive stock management operations:
  * 
- * AVAILABLE ACTIONS:
- * 1. adjust - Adjust stock quantities (add/remove)
- * 2. transfer - Transfer stock between warehouses
- * 3. report - Generate inventory reports
- * 4. alert - Set up low stock alerts
+ * OPERATIONS:
+ * 1. Stock Adjustments (add/remove stock)
+ * 2. Stock Transfers (between warehouses)
+ * 3. Inventory Reports (comprehensive reporting)
+ * 4. Stock Alerts (low stock notifications)
  * 
  * BUSINESS RULES:
- * - Only Stock Managers and Admins can manage stock
- * - All stock adjustments are logged for audit trail
- * - Stock transfers require validation of source warehouse
+ * - Only Stock Managers and Admins can perform stock operations
+ * - All operations are logged for audit trail
+ * - Stock transfers require sufficient quantity in source warehouse
  * - Low stock alerts are automatically triggered
- * - Inventory reports include detailed analytics
+ * - Inventory reports include warehouse breakdowns
  * 
- * STOCK ADJUSTMENT:
- * - Can add or remove stock quantities
- * - Requires reason for adjustment
- * - Updates last_updated timestamp
- * - Logs all changes for audit
+ * VALIDATION RULES:
+ * - All required fields must be provided
+ * - Quantities must be positive numbers
+ * - Warehouse IDs must be valid UUIDs
+ * - Product IDs must be valid UUIDs
  * 
- * STOCK TRANSFER:
- * - Validates source warehouse has sufficient stock
- * - Creates transfer record
- * - Updates both source and destination warehouses
- * - Maintains audit trail
- * 
- * INVENTORY REPORTS:
- * - Current stock levels by warehouse
- * - Low stock items
- * - Stock movement history
- * - Value calculations
+ * AUDIT TRAIL:
+ * - All stock movements are logged
+ * - User actions are tracked
+ * - Detailed change history maintained
  */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
-    // Only allow POST for stock management actions
+    // Only allow POST for stock management
     if (req.method !== 'POST') {
       return res.status(405).json({
         error: 'Method not allowed',
@@ -70,30 +95,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       })
     }
 
-    const user = JSON.parse(userData)
-    const validatedData = stockManagementSchema.parse(req.body)
+    const user: User = JSON.parse(userData)
+    const { action, ...data } = req.body
 
-    // Check if user is Stock Manager or Admin
+    // Check user permissions
     if (user.role !== 'stock_manager' && user.role !== 'admin') {
       return res.status(403).json({
-        error: 'Only Stock Managers can manage inventory',
+        error: 'Only Stock Managers and Admins can perform stock operations',
         code: 'INSUFFICIENT_PERMISSIONS',
       })
     }
 
     // Handle different stock management actions
-    switch (validatedData.action) {
+    switch (action) {
       case 'adjust':
-        return await handleStockAdjustment(req, res, user, validatedData)
+        return await handleStockAdjustment(req, res, user, data)
       
       case 'transfer':
-        return await handleStockTransfer(req, res, user, validatedData)
+        return await handleStockTransfer(req, res, user, data)
       
       case 'report':
-        return await handleInventoryReport(req, res, user, validatedData)
+        return await handleInventoryReport(req, res, user)
       
       case 'alert':
-        return await handleStockAlert(req, res, user, validatedData)
+        return await handleStockAlert(req, res, user, data)
       
       default:
         return res.status(400).json({
@@ -122,48 +147,46 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 /**
  * STOCK ADJUSTMENT
  * 
- * Allows Stock Managers to adjust stock quantities:
- * - Add stock (positive quantity)
- * - Remove stock (negative quantity)
- * - Requires reason for adjustment
- * - Logs all changes for audit trail
+ * Adds or removes stock from a warehouse:
+ * - Validates stock exists in the warehouse
+ * - Updates quantity based on action (add/remove)
+ * - Logs the adjustment for audit trail
+ * - Sends notifications for significant changes
  */
 async function handleStockAdjustment(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  data: any
+  user: User,
+  data: StockData
 ) {
-  if (!data.product_id || !data.warehouse_id || data.quantity === undefined) {
-    return res.status(400).json({
-      error: 'product_id, warehouse_id, and quantity are required for stock adjustment',
-      code: 'MISSING_REQUIRED_FIELDS',
-    })
-  }
+  const validatedData = stockAdjustmentSchema.parse({ ...req.body, ...data })
 
   try {
+    // Use database transaction for atomicity
     const result = await prisma.$transaction(async (tx) => {
       // Get current stock
       const currentStock = await tx.stocks.findFirst({
         where: {
-          product_id: data.product_id,
-          warehouse_id: data.warehouse_id,
+          product_id: validatedData.product_id,
+          warehouse_id: validatedData.warehouse_id,
         },
         include: {
           products: true,
+          warehouses: true,
         },
       })
 
       if (!currentStock) {
-        throw new Error('Stock record not found for this product and warehouse')
+        throw new Error('Stock not found for this product and warehouse')
       }
 
       // Calculate new quantity
-      const newQuantity = Number(currentStock.quantity) + data.quantity
+      const newQuantity = validatedData.action === 'add' 
+        ? Number(currentStock.quantity) + validatedData.quantity
+        : Number(currentStock.quantity) - validatedData.quantity
 
-      // Prevent negative stock (unless it's a correction)
       if (newQuantity < 0) {
-        throw new Error('Stock adjustment would result in negative quantity')
+        throw new Error('Insufficient stock to remove')
       }
 
       // Update stock
@@ -171,7 +194,12 @@ async function handleStockAdjustment(
         where: { stock_id: currentStock.stock_id },
         data: {
           quantity: newQuantity,
+          unit_price: validatedData.unit_price || currentStock.unit_price,
           last_updated: new Date(),
+        },
+        include: {
+          products: true,
+          warehouses: true,
         },
       })
 
@@ -184,34 +212,39 @@ async function handleStockAdjustment(
           user_id: user.id,
           details: {
             action: 'stock_adjustment',
-            product_id: data.product_id,
-            warehouse_id: data.warehouse_id,
+            adjustment_type: validatedData.action,
+            quantity_change: validatedData.quantity,
             previous_quantity: currentStock.quantity,
-            adjustment: data.quantity,
             new_quantity: newQuantity,
-            reason: data.reason || 'Manual adjustment',
+            reason: validatedData.reason,
           },
         },
       })
 
-      return {
-        stock: updatedStock,
-        product: currentStock.products,
-        adjustment: data.quantity,
-        previous_quantity: currentStock.quantity,
-        new_quantity: newQuantity,
-      }
+      return updatedStock
     })
+
+    // Send notification for significant changes
+    if (validatedData.quantity > 100) {
+      await prisma.notifications.create({
+        data: {
+          user_id: user.id,
+          type: 'email',
+          message: `Large stock adjustment: ${validatedData.action} ${validatedData.quantity} units of ${result.products.name} in ${result.warehouses.name}`,
+          status: 'sent',
+        },
+      })
+    }
 
     return res.status(200).json({
       data: result,
-      message: `Stock adjusted successfully. ${data.quantity > 0 ? 'Added' : 'Removed'} ${Math.abs(data.quantity)} units.`,
+      message: `Stock ${validatedData.action}ed successfully`,
     })
   } catch (error) {
     console.error('Stock adjustment error:', error)
     return res.status(500).json({
-      error: error instanceof Error ? error.message : 'Stock adjustment failed',
-      code: 'STOCK_ADJUSTMENT_FAILED',
+      error: error instanceof Error ? error.message : 'Failed to adjust stock',
+      code: 'ADJUSTMENT_FAILED',
     })
   }
 }
@@ -220,41 +253,32 @@ async function handleStockAdjustment(
  * STOCK TRANSFER
  * 
  * Transfers stock between warehouses:
- * - Validates source warehouse has sufficient stock
- * - Updates both source and destination warehouses
- * - Creates transfer record for audit trail
- * - Maintains data consistency with transactions
+ * - Validates sufficient stock in source warehouse
+ * - Reduces stock in source warehouse
+ * - Increases stock in destination warehouse
+ * - Logs the transfer for audit trail
+ * - Sends notifications to relevant staff
  */
 async function handleStockTransfer(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  data: any
+  user: User,
+  data: StockData
 ) {
-  if (!data.product_id || !data.from_warehouse_id || !data.to_warehouse_id || !data.quantity) {
-    return res.status(400).json({
-      error: 'product_id, from_warehouse_id, to_warehouse_id, and quantity are required for stock transfer',
-      code: 'MISSING_REQUIRED_FIELDS',
-    })
-  }
-
-  if (data.from_warehouse_id === data.to_warehouse_id) {
-    return res.status(400).json({
-      error: 'Source and destination warehouses must be different',
-      code: 'INVALID_TRANSFER',
-    })
-  }
+  const validatedData = stockTransferSchema.parse({ ...req.body, ...data })
 
   try {
+    // Use database transaction for atomicity
     const result = await prisma.$transaction(async (tx) => {
       // Get source stock
       const sourceStock = await tx.stocks.findFirst({
         where: {
-          product_id: data.product_id,
-          warehouse_id: data.from_warehouse_id,
+          product_id: validatedData.product_id,
+          warehouse_id: validatedData.from_warehouse_id,
         },
         include: {
           products: true,
+          warehouses: true,
         },
       })
 
@@ -262,15 +286,19 @@ async function handleStockTransfer(
         throw new Error('Source stock not found')
       }
 
-      if (sourceStock.quantity < data.quantity) {
+      if (Number(sourceStock.quantity) < validatedData.quantity) {
         throw new Error('Insufficient stock in source warehouse')
       }
 
       // Get or create destination stock
       let destinationStock = await tx.stocks.findFirst({
         where: {
-          product_id: data.product_id,
-          warehouse_id: data.to_warehouse_id,
+          product_id: validatedData.product_id,
+          warehouse_id: validatedData.to_warehouse_id,
+        },
+        include: {
+          products: true,
+          warehouses: true,
         },
       })
 
@@ -278,11 +306,14 @@ async function handleStockTransfer(
         // Create new stock record for destination
         destinationStock = await tx.stocks.create({
           data: {
-            product_id: data.product_id,
-            warehouse_id: data.to_warehouse_id,
-            quantity: data.quantity,
+            product_id: validatedData.product_id,
+            warehouse_id: validatedData.to_warehouse_id,
+            quantity: validatedData.quantity,
             unit_price: sourceStock.unit_price,
-            last_updated: new Date(),
+          },
+          include: {
+            products: true,
+            warehouses: true,
           },
         })
       } else {
@@ -290,8 +321,12 @@ async function handleStockTransfer(
         destinationStock = await tx.stocks.update({
           where: { stock_id: destinationStock.stock_id },
           data: {
-            quantity: Number(destinationStock.quantity) + data.quantity,
+            quantity: Number(destinationStock.quantity) + validatedData.quantity,
             last_updated: new Date(),
+          },
+          include: {
+            products: true,
+            warehouses: true,
           },
         })
       }
@@ -300,8 +335,12 @@ async function handleStockTransfer(
       const updatedSourceStock = await tx.stocks.update({
         where: { stock_id: sourceStock.stock_id },
         data: {
-          quantity: Number(sourceStock.quantity) - data.quantity,
+          quantity: Number(sourceStock.quantity) - validatedData.quantity,
           last_updated: new Date(),
+        },
+        include: {
+          products: true,
+          warehouses: true,
         },
       })
 
@@ -314,11 +353,10 @@ async function handleStockTransfer(
           user_id: user.id,
           details: {
             action: 'stock_transfer',
-            product_id: data.product_id,
-            from_warehouse_id: data.from_warehouse_id,
-            to_warehouse_id: data.to_warehouse_id,
-            quantity_transferred: data.quantity,
-            reason: data.reason || 'Manual transfer',
+            from_warehouse: sourceStock.warehouses.name,
+            to_warehouse: destinationStock.warehouses.name,
+            quantity_transferred: validatedData.quantity,
+            reason: validatedData.reason,
           },
         },
       })
@@ -326,20 +364,28 @@ async function handleStockTransfer(
       return {
         source_stock: updatedSourceStock,
         destination_stock: destinationStock,
-        product: sourceStock.products,
-        quantity_transferred: data.quantity,
       }
+    })
+
+    // Send notification
+    await prisma.notifications.create({
+      data: {
+        user_id: user.id,
+        type: 'email',
+        message: `Stock transfer completed: ${validatedData.quantity} units of ${result.destination_stock.products.name} from ${result.source_stock.warehouses.name} to ${result.destination_stock.warehouses.name}`,
+        status: 'sent',
+      },
     })
 
     return res.status(200).json({
       data: result,
-      message: `Stock transfer completed successfully. ${data.quantity} units transferred.`,
+      message: 'Stock transfer completed successfully',
     })
   } catch (error) {
     console.error('Stock transfer error:', error)
     return res.status(500).json({
-      error: error instanceof Error ? error.message : 'Stock transfer failed',
-      code: 'STOCK_TRANSFER_FAILED',
+      error: error instanceof Error ? error.message : 'Failed to transfer stock',
+      code: 'TRANSFER_FAILED',
     })
   }
 }
@@ -348,41 +394,37 @@ async function handleStockTransfer(
  * INVENTORY REPORT
  * 
  * Generates comprehensive inventory reports:
- * - Current stock levels by warehouse
- * - Low stock items
- * - Stock value calculations
+ * - Total stock value and items count
+ * - Low stock items identification
+ * - Warehouse breakdown
  * - Recent stock movements
+ * - Stock value calculations
  */
 async function handleInventoryReport(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  data: any
+  user: User
 ) {
   try {
-    // Get all stock with product and warehouse details
+    // Get all stock with related data
     const stockReport = await prisma.stocks.findMany({
       include: {
         products: true,
         warehouses: true,
       },
-      orderBy: [
-        { warehouses: { name: 'asc' } },
-        { products: { name: 'asc' } },
-      ],
     })
 
     // Calculate totals
     const totalItems = stockReport.length
-    const totalValue = stockReport.reduce((sum, stock) => {
-      return sum + (Number(stock.quantity) * Number(stock.unit_price))
-    }, 0)
+    const totalValue = stockReport.reduce((sum, stock) => 
+      sum + (Number(stock.quantity) * Number(stock.unit_price)), 0
+    )
 
     // Find low stock items (less than 10 units)
     const lowStockItems = stockReport.filter(stock => Number(stock.quantity) < 10)
 
     // Group by warehouse
-    const warehouseReport = stockReport.reduce((acc: Record<string, any>, stock) => {
+    const warehouseReport = stockReport.reduce((acc: Record<string, { warehouse: Warehouse; items: Stock[]; total_value: number }>, stock) => {
       const warehouseName = stock.warehouses.name
       if (!acc[warehouseName]) {
         acc[warehouseName] = {
@@ -394,7 +436,7 @@ async function handleInventoryReport(
       acc[warehouseName].items.push(stock)
       acc[warehouseName].total_value += Number(stock.quantity) * Number(stock.unit_price)
       return acc
-    }, {} as Record<string, any>)
+    }, {})
 
     // Get recent stock movements (last 30 days)
     const recentMovements = await prisma.transaction_logs.findMany({
@@ -446,21 +488,16 @@ async function handleInventoryReport(
 async function handleStockAlert(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  data: any
+  user: User,
+  data: StockAlertData
 ) {
-  if (!data.product_id || !data.threshold) {
-    return res.status(400).json({
-      error: 'product_id and threshold are required for stock alerts',
-      code: 'MISSING_REQUIRED_FIELDS',
-    })
-  }
+  const validatedData = stockAlertSchema.parse(data)
 
   try {
     // Get current stock
     const currentStock = await prisma.stocks.findFirst({
       where: {
-        product_id: data.product_id,
+        product_id: validatedData.product_id,
       },
       include: {
         products: true,
@@ -475,7 +512,7 @@ async function handleStockAlert(
     }
 
     // Check if stock is below threshold
-    const isLowStock = Number(currentStock.quantity) <= data.threshold
+    const isLowStock = Number(currentStock.quantity) <= validatedData.threshold
 
     if (isLowStock) {
       // Send notification to stock manager
@@ -483,7 +520,7 @@ async function handleStockAlert(
         data: {
           user_id: user.id,
           type: 'email',
-          message: `LOW STOCK ALERT: ${currentStock.products.name} is below threshold. Current: ${currentStock.quantity}, Threshold: ${data.threshold}`,
+          message: `LOW STOCK ALERT: ${currentStock.products.name} is below threshold. Current: ${currentStock.quantity}, Threshold: ${validatedData.threshold}`,
           status: 'sent',
         },
       })
@@ -497,9 +534,9 @@ async function handleStockAlert(
           user_id: user.id,
           details: {
             action: 'low_stock_alert',
-            product_id: data.product_id,
+            product_id: validatedData.product_id,
             current_quantity: currentStock.quantity,
-            threshold: data.threshold,
+            threshold: validatedData.threshold,
             alert_triggered: true,
           },
         },
@@ -510,7 +547,7 @@ async function handleStockAlert(
       data: {
         product: currentStock.products,
         current_quantity: currentStock.quantity,
-        threshold: data.threshold,
+        threshold: validatedData.threshold,
         is_low_stock: isLowStock,
         alert_sent: isLowStock,
       },

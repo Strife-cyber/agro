@@ -1,39 +1,60 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextApiRequest, NextApiResponse } from 'next'
 import { prisma } from '@/lib/prisma'
 import { z } from 'zod'
+import { Approvisionnement } from '@/types'
 
-// Validation schema for approvisionnement workflow actions
+// Type definitions for workflow functions
+interface WorkflowUser {
+  id: string
+  email: string
+  name: string
+  role: string
+}
+
+interface WorkflowData {
+  notes?: string
+  reason?: string
+  actual_quantity?: number
+  actual_price?: number
+}
+
+// Validation schema for workflow actions
 const workflowActionSchema = z.object({
-  approvisionnement_id: z.string().uuid(),
   action: z.enum(['validate_bd', 'reject_bd', 'receive_stock', 'reject_stock']),
+  approvisionnement_id: z.string().uuid(),
   notes: z.string().optional(),
-  business_developer_id: z.string().optional(), // For BD actions
-  stock_manager_id: z.string().optional(), // For stock manager actions
+  reason: z.string().optional(),
+  actual_quantity: z.number().positive().optional(),
+  actual_price: z.number().positive().optional(),
 })
 
 /**
  * APPROVISIONNEMENT WORKFLOW ENDPOINT
  * 
- * This endpoint handles the complex business logic for supply chain management:
+ * This endpoint handles the complete approvisionnement workflow:
  * 
  * WORKFLOW STEPS:
- * 1. Supplier creates approvisionnement (status: pending)
- * 2. Business Developer validates/rejects (status: validated_bd / rejected)
- * 3. Stock Manager receives/rejects physical stock (status: received / rejected)
+ * 1. Supplier submits approvisionnement (pending)
+ * 2. Business Developer validates or rejects (validated_bd / rejected)
+ * 3. Stock Manager receives or rejects stock (received / rejected)
  * 
  * BUSINESS RULES:
  * - Only Business Developers can validate/reject approvisionnements
- * - Only Stock Managers can receive/reject physical stock
- * - When stock is received, inventory is automatically updated
- * - Payment to supplier is triggered when stock is received
+ * - Only Stock Managers can receive/reject stock
  * - All actions are logged for audit trail
+ * - Notifications are sent to relevant parties
+ * - Stock is automatically updated upon receipt
  * 
- * STATUS TRANSITIONS:
- * pending → validated_bd → received (SUCCESS PATH)
- * pending → validated_bd → rejected (BD REJECTION)
- * pending → rejected (BD REJECTION)
- * validated_bd → rejected (STOCK MANAGER REJECTION)
+ * VALIDATION RULES:
+ * - Business Developer validation: pending → validated_bd
+ * - Business Developer rejection: pending → rejected
+ * - Stock Manager receipt: validated_bd → received
+ * - Stock Manager rejection: validated_bd → rejected
+ * 
+ * NOTIFICATIONS:
+ * - Stock Manager notified when Business Developer validates
+ * - Business Developer notified when Stock Manager receives/rejects
+ * - All actions logged in transaction_logs
  */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
@@ -54,16 +75,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       })
     }
 
-    const user = JSON.parse(userData)
+    const user: WorkflowUser = JSON.parse(userData)
     const validatedData = workflowActionSchema.parse(req.body)
 
-    // Get the approvisionnement
+    // Get approvisionnement
     const approvisionnement = await prisma.approvisionnements.findUnique({
       where: { approvisionnement_id: validatedData.approvisionnement_id },
       include: {
         products: true,
-        warehouses: true,
-        users_approvisionnements_supplier_idTousers: true,
       },
     })
 
@@ -95,7 +114,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         })
     }
   } catch (error) {
-    console.error('Approvisionnement workflow error:', error)
+    console.error('Workflow error:', error)
     
     if (error instanceof z.ZodError) {
       return res.status(400).json({
@@ -115,8 +134,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 /**
  * BUSINESS DEVELOPER VALIDATION
  * 
- * Business Developer validates the approvisionnement after reviewing:
- * - Product quality and pricing
+ * Business Developer validates the approvisionnement based on:
+ * - Product quality assessment
+ * - Price competitiveness
  * - Supplier reliability
  * - Market demand
  * 
@@ -125,9 +145,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 async function handleBusinessDeveloperValidation(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  approvisionnement: any,
-  data: any
+  user: WorkflowUser,
+  approvisionnement: Approvisionnement,
+  data: WorkflowData
 ) {
   // Check if user is Business Developer
   if (user.role !== 'business_developer' && user.role !== 'admin') {
@@ -205,9 +225,9 @@ async function handleBusinessDeveloperValidation(
 async function handleBusinessDeveloperRejection(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  approvisionnement: any,
-  data: any
+  user: WorkflowUser,
+  approvisionnement: Approvisionnement,
+  data: WorkflowData
 ) {
   // Check if user is Business Developer
   if (user.role !== 'business_developer' && user.role !== 'admin') {
@@ -285,9 +305,9 @@ async function handleBusinessDeveloperRejection(
 async function handleStockReceival(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  approvisionnement: any,
-  data: any
+  user: WorkflowUser,
+  approvisionnement: Approvisionnement,
+  data: WorkflowData
 ) {
   // Check if user is Stock Manager
   if (user.role !== 'stock_manager' && user.role !== 'admin') {
@@ -414,9 +434,9 @@ async function handleStockReceival(
 async function handleStockRejection(
   req: NextApiRequest,
   res: NextApiResponse,
-  user: any,
-  approvisionnement: any,
-  data: any
+  user: WorkflowUser,
+  approvisionnement: Approvisionnement,
+  data: WorkflowData
 ) {
   // Check if user is Stock Manager
   if (user.role !== 'stock_manager' && user.role !== 'admin') {

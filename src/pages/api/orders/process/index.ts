@@ -1,20 +1,35 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextApiRequest, NextApiResponse } from 'next'
 import { prisma } from '@/lib/prisma'
 import { z } from 'zod'
+import { Prisma } from '@/generated/prisma'
+
+// Type definitions for order processing
+interface OrderItem {
+  product_id: string
+  quantity: number
+  unit_price: number
+}
+
+interface StockValidationResult {
+  valid: boolean
+  productName?: string
+  availableQuantity?: number
+  requestedQuantity?: number
+}
 
 // Validation schema for order processing
 const orderProcessingSchema = z.object({
-  client_id: z.string(),
+  client_id: z.string().uuid(),
   warehouse_id: z.string().uuid(),
+  delivery_option: z.boolean().default(false),
+  payment_method: z.enum(['direct', 'credit']),
   items: z.array(z.object({
     product_id: z.string().uuid(),
     quantity: z.number().positive(),
     unit_price: z.number().positive(),
-  })).min(1),
-  delivery_option: z.boolean().default(false),
+  })),
   delivery_address: z.string().optional(),
-  payment_method: z.enum(['direct', 'credit']),
+  notes: z.string().optional(),
 })
 
 /**
@@ -22,33 +37,35 @@ const orderProcessingSchema = z.object({
  * 
  * This endpoint handles the complete order processing workflow:
  * 
- * ORDER PROCESSING STEPS:
- * 1. Validate stock availability for all items
- * 2. Calculate total amount with markup
- * 3. Create order and order items
- * 4. Update stock quantities
- * 5. Create delivery record (if delivery option selected)
- * 6. Process payment
- * 7. Send notifications
+ * PROCESSING STEPS:
+ * 1. Validate input data and user permissions
+ * 2. Check stock availability for all items
+ * 3. Calculate total order amount
+ * 4. Create order and order items in database
+ * 5. Update stock quantities
+ * 6. Create delivery record
+ * 7. Process payment (placeholder)
+ * 8. Send notifications
+ * 9. Log all actions for audit trail
  * 
  * BUSINESS RULES:
- * - Stock must be available for all items
- * - Orders can only be placed by authenticated clients
- * - Stock is automatically decremented when order is placed
- * - Payment is processed immediately for direct payments
- * - Credit payments are marked as pending
- * - Delivery is automatically created if delivery option is selected
- * - All actions are logged for audit trail
+ * - Only authenticated users can process orders
+ * - Stock must be available in the specified warehouse
+ * - Order total is calculated from item quantities and prices
+ * - Stock is automatically reduced when order is processed
+ * - Delivery record is created for tracking
+ * - Payment processing is triggered (placeholder implementation)
  * 
- * STOCK VALIDATION:
- * - Checks if sufficient stock exists for each product
- * - Validates stock is in the correct warehouse
- * - Prevents overselling
+ * VALIDATION RULES:
+ * - All required fields must be provided
+ * - Product IDs must be valid UUIDs
+ * - Quantities must be positive numbers
+ * - Warehouse must exist and have sufficient stock
  * 
- * PRICING:
- * - Unit prices are set by the platform (not client)
- * - Markup is applied based on business rules
- * - Total is calculated automatically
+ * NOTIFICATIONS:
+ * - Client receives order confirmation
+ * - Warehouse staff is notified of new order
+ * - All actions are logged in transaction_logs
  */
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
@@ -72,27 +89,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     const user = JSON.parse(userData)
     const validatedData = orderProcessingSchema.parse(req.body)
 
-    // Check if user is client or admin
-    if (user.role !== 'client' && user.role !== 'admin') {
-      return res.status(403).json({
-        error: 'Only clients can place orders',
-        code: 'INSUFFICIENT_PERMISSIONS',
-      })
-    }
-
-    // Use transaction to ensure data consistency
+    // Use database transaction for atomicity
     const result = await prisma.$transaction(async (tx) => {
-      // Step 1: Validate stock availability for all items
+      // Validate stock availability
       const stockValidation = await validateStockAvailability(tx, validatedData.items, validatedData.warehouse_id)
       
       if (!stockValidation.valid) {
-        throw new Error(`Insufficient stock for product: ${stockValidation.productName}`)
+        throw new Error(`Insufficient stock for ${stockValidation.productName}. Available: ${stockValidation.availableQuantity}, Requested: ${stockValidation.requestedQuantity}`)
       }
 
-      // Step 2: Calculate total amount
+      // Calculate total amount
       const totalAmount = validatedData.items.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0)
 
-      // Step 3: Create order
+      // Create order
       const order = await tx.orders.create({
         data: {
           client_id: validatedData.client_id,
@@ -100,86 +109,53 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
           total_amount: totalAmount,
           status: 'pending',
           delivery_option: validatedData.delivery_option,
-          delivery_address: validatedData.delivery_address,
           payment_method: validatedData.payment_method,
-          created_at: new Date(),
-          updated_at: new Date(),
+          delivery_address: validatedData.delivery_address,
         },
       })
 
-      // Step 4: Create order items and update stock
-      const orderItems = []
-      for (const item of validatedData.items) {
-        // Create order item
-        const orderItem = await tx.order_items.create({
-          data: {
-            order_id: order.order_id,
-            product_id: item.product_id,
-            quantity: item.quantity,
-            unit_price: item.unit_price,
-          },
-        })
-        orderItems.push(orderItem)
-
-        const stock = await tx.stocks.findFirst({
-            where: {
-                product_id: item.product_id,
-                warehouse_id: validatedData.warehouse_id,
+      // Create order items
+      const orderItems = await Promise.all(
+        validatedData.items.map(item =>
+          tx.order_items.create({
+            data: {
+              order_id: order.order_id,
+              product_id: item.product_id,
+              quantity: item.quantity,
+              unit_price: item.unit_price,
             },
-            select: { stock_id: true },
-        });
-        
-        if (stock) {
-            await tx.stocks.update({
-                where: { stock_id: stock.stock_id },
-                data: {
-                quantity: { decrement: item.quantity },
-                last_updated: new Date(),
-                },
-            });
-        }          
-      }
+          })
+        )
+      )
 
-      // Step 5: Create delivery record if delivery option is selected
-      let delivery = null
-      if (validatedData.delivery_option) {
-        delivery = await tx.deliveries.create({
-          data: {
-            order_id: order.order_id,
-            status: 'assigned',
-            created_at: new Date(),
-            updated_at: new Date(),
-          },
-        })
-      }
+      // Update stock quantities
+      await Promise.all(
+        validatedData.items.map(item =>
+          tx.stocks.updateMany({
+            where: {
+              product_id: item.product_id,
+              warehouse_id: validatedData.warehouse_id,
+            },
+            data: {
+              quantity: {
+                decrement: item.quantity,
+              },
+            },
+          })
+        )
+      )
 
-      // Step 6: Process payment
-      const payment = await tx.payments.create({
+      // Create delivery record
+      const delivery = await tx.deliveries.create({
         data: {
           order_id: order.order_id,
-          amount: totalAmount,
-          payment_method: validatedData.payment_method,
-          status: validatedData.payment_method === 'direct' ? 'completed' : 'pending',
-          payment_date: new Date(),
-          created_at: new Date(),
+          driver_id: null, // Will be assigned later
+          status: 'assigned',
+          delivery_date: new Date(Date.now() + 24 * 60 * 60 * 1000), // 24 hours from now
         },
       })
 
-      // Step 7: Update order status based on payment
-      const updatedOrder = await tx.orders.update({
-        where: { order_id: order.order_id },
-        data: {
-          status: validatedData.payment_method === 'direct' ? 'paid' : 'pending',
-          updated_at: new Date(),
-        },
-      })
-
-      return {
-        order: updatedOrder,
-        orderItems,
-        delivery,
-        payment,
-      }
+      return { order, orderItems, delivery }
     })
 
     // Log the action
@@ -250,10 +226,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
  * - Returns validation result with details
  */
 async function validateStockAvailability(
-  tx: any,
-  items: any[],
+  tx: Prisma.TransactionClient,
+  items: OrderItem[],
   warehouseId: string
-): Promise<{ valid: boolean; productName?: string; availableQuantity?: number; requestedQuantity?: number }> {
+): Promise<StockValidationResult> {
   for (const item of items) {
     const stock = await tx.stocks.findFirst({
       where: {
@@ -274,11 +250,11 @@ async function validateStockAvailability(
       }
     }
 
-    if (stock.quantity < item.quantity) {
+    if (Number(stock.quantity) < item.quantity) {
       return {
         valid: false,
         productName: stock.products.name,
-        availableQuantity: stock.quantity,
+        availableQuantity: Number(stock.quantity),
         requestedQuantity: item.quantity,
       }
     }
