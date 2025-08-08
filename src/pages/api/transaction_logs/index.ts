@@ -1,5 +1,12 @@
 import { prisma } from "@/lib/prisma";
 import { createCrudHandler } from "@/utils/crud-handler";
 
-// Create a CRUD handler for the 'users' model
-export default createCrudHandler('transaction_logs', prisma);
+export default createCrudHandler({
+  model: 'transaction_logs',
+  prisma,
+  validationSchema: undefined, // Transaction logs are read-only
+  allowedRoles: ['admin', 'business_developer', 'stock_manager'],
+  enablePagination: true,
+  enableSoftDelete: false,
+  auditLog: false, // Don't log audit logs
+});
