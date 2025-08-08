@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
 import { NextApiRequest, NextApiResponse } from 'next'
 import { stackServerApp } from '@/stack'
 import { prisma } from './prisma'
@@ -12,10 +11,21 @@ export interface AuthenticatedRequest extends NextApiRequest {
   }
 }
 
+export interface AuthResult {
+  user?: {
+    id: string
+    email: string
+    name: string
+    role: string
+  }
+  error?: string
+}
+
+export type ApiHandler = (req: AuthenticatedRequest, res: NextApiResponse) => Promise<void> | void
+
 export async function authenticateRequest(
-  req: NextApiRequest,
-  res: NextApiResponse
-): Promise<{ user?: any; error?: string }> {
+  req: NextApiRequest
+): Promise<AuthResult> {
   try {
     // Get the authorization header
     const authHeader = req.headers.authorization
@@ -23,8 +33,6 @@ export async function authenticateRequest(
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return { error: 'Missing or invalid authorization header' }
     }
-
-    const token = authHeader.substring(7) // Remove 'Bearer ' prefix
 
     // Verify the token with Stack
     const user = await stackServerApp.getUser()
@@ -48,16 +56,23 @@ export async function authenticateRequest(
       return { error: 'User not found in database' }
     }
 
-    return { user: dbUser }
+    return { 
+      user: {
+        id: dbUser.id,
+        email: dbUser.email || '',
+        name: dbUser.name || '',
+        role: dbUser.role || 'client'
+      }
+    }
   } catch (error) {
     console.error('Authentication error:', error)
     return { error: 'Authentication failed' }
   }
 }
 
-export function withAuth(handler: any) {
+export function withAuth(handler: ApiHandler): ApiHandler {
   return async (req: AuthenticatedRequest, res: NextApiResponse) => {
-    const authResult = await authenticateRequest(req, res)
+    const authResult = await authenticateRequest(req)
     
     if (authResult.error) {
       return res.status(401).json({
@@ -72,9 +87,9 @@ export function withAuth(handler: any) {
 }
 
 export function withRoleAuth(allowedRoles: string[]) {
-  return (handler: any) => {
+  return (handler: ApiHandler): ApiHandler => {
     return async (req: AuthenticatedRequest, res: NextApiResponse) => {
-      const authResult = await authenticateRequest(req, res)
+      const authResult = await authenticateRequest(req)
       
       if (authResult.error) {
         return res.status(401).json({
