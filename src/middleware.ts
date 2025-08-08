@@ -9,6 +9,11 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next(); // skip middleware
   }
 
+  // Skip documentation endpoints - allow public access
+  if (pathname.startsWith('/api/docs') || pathname.startsWith('/docs') || pathname.startsWith('/api-docs')) {
+    return NextResponse.next(); // skip middleware
+  }
+
   // For API routes, handle authentication and store user data
   if (pathname.startsWith('/api/')) {
     try {
@@ -45,5 +50,5 @@ export async function middleware(request: NextRequest) {
 }
 
 export const config = {
-  matcher: '/api/:path*',
+  matcher: ['/api/:path*', '/docs', '/api-docs'],
 };
